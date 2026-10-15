@@ -1,8 +1,10 @@
+import math
 from collections import defaultdict
 from typing import Any, List, Optional
 
 import networkx as nx
 import overpy
+import datetime
 from overpy import Node as OverpyNode
 from overpy.exception import DataIncomplete
 from yaramo import model
@@ -27,6 +29,18 @@ from orm_importer.utils import (
     merge_edges,
 )
 
+from urllib.request import Request
+
+def create_overpass_with_url(url: str | None = None) -> overpy.Overpass:
+    if url is None:
+        url = 'https://overpass-api.de/api/interpreter'
+    req = Request(url)
+    req.add_header('Referer', 'https://overpass-api.eu/')
+    req.add_header('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8')
+    req.add_header('Origin', 'https://overpass-turbo.eu')
+    req.add_header('User-Agent', 'yaramo')
+    return overpy.Overpass(url=req)  # type: ignore  # openurl() accepts Request
+
 
 class ORMImporter:
     def __init__(self):
@@ -35,17 +49,23 @@ class ORMImporter:
         self.node_data: dict[str, OverpyNode] = {}
         self.ways: dict[str, List[overpy.Way]] = defaultdict(list)
         self.paths: dict[tuple[Optional[Any], Optional[Any]], List[List]] = defaultdict(list)
-        self.api = overpy.Overpass(url="https://osm.hpi.de/overpass/api/interpreter")
+        self.api = create_overpass_with_url()#url="https://osm.hpi.de/overpass/api/interpreter")#overpy.Overpass(url="https://osm.hpi.de/overpass/api/interpreter")
         self.topology = Topology()
 
-    def _get_track_objects(self, polygon: str, railway_option_types: list[str]):
+        print("orm_importer built")
+        print(self.api.url)
+
+    def _get_track_objects(self, polygon: str, railway_option_types: list[str], date: datetime.datetime):
+        if date is None:
+            date = datetime.datetime.now()
         query_parts = ""
         for _type in railway_option_types:
             query_parts = (
                 query_parts
-                + f'way["railway"="{_type}"](poly: "{polygon}");node(w)(poly: "{polygon}");'
+                + f'way["railway"="{_type}"](poly: "{polygon}");node(w);'#(poly: "{polygon}");'
             )
-        query = f"({query_parts});out body;"
+        date_prefix = f'[timeout:60][date:"{date.strftime("%Y-%m-%dT%H:%M:%SZ")}"];'
+        query = f"{date_prefix}({query_parts});out body;"
         print(query)
         return self._query_api(query)
 
@@ -154,10 +174,10 @@ class ORMImporter:
         present_paths = self.paths[(node_a, node_b)] + self.paths[(node_b, node_a)]
         return path not in present_paths and reversed_path not in present_paths
 
-    def run(self, polygon, railway_option_types: list[str] = None):
+    def run(self, polygon, railway_option_types: list[str] = None, date: datetime.datetime | None = None):
         if railway_option_types is None:
             railway_option_types = ["rail"]
-        track_objects = self._get_track_objects(polygon, railway_option_types)
+        track_objects = self._get_track_objects(polygon, railway_option_types, date)
         self.graph = self._build_graph(track_objects)
 
         # ToDo: Check whether all edges really link to each other in ORM or if there might be
@@ -197,8 +217,10 @@ class ORMImporter:
                     if node_a and node_b and self._should_add_edge(node_a, node_b, path):
                         self.paths[(node_a, node_b)].append(path)
                         current_edge = model.Edge(node_a, node_b)
-                        node_a.connected_edges.append(current_edge)
-                        node_b.connected_edges.append(current_edge)
+                        if current_edge not in node_a.connected_edges:
+                            node_a.connected_edges.append(current_edge)
+                        if current_edge not in node_b.connected_edges:
+                            node_b.connected_edges.append(current_edge)
                         self.topology.add_edge(current_edge)
                         self._add_geo_nodes(path, current_edge)
                         current_edge.update_length()
@@ -257,8 +279,10 @@ class ORMImporter:
                                 new_edge = Edge(node, new_node)
                                 new_edge.maximum_speed = 160
                                 new_edge.update_length()
-                                node.connected_edges.append(new_edge)
-                                new_node.connected_edges.append(new_edge)
+                                if new_edge not in node.connected_edges:
+                                    node.connected_edges.append(new_edge)
+                                if new_edge not in new_node.connected_edges:    
+                                    new_node.connected_edges.append(new_edge)
                                 nodes_to_add.append(new_node)
                                 self.topology.add_edge(new_edge)
                                 break
