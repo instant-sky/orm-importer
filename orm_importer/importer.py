@@ -1,31 +1,36 @@
+import datetime
+import math
 from collections import defaultdict
 from typing import Any, List, Optional
+from urllib.request import Request
 
 import networkx as nx
 import overpy
+from orm_importer.utils import (dist_edge, get_additional_signals,
+                                get_opposite_edge_pairs,
+                                get_signal_classification_number,
+                                get_signal_direction, get_signal_function,
+                                get_signal_kind, get_signal_name,
+                                get_signal_states, is_end_node, is_same_edge,
+                                is_signal, is_switch, merge_edges)
 from overpy import Node as OverpyNode
 from overpy.exception import DataIncomplete
+
 from yaramo import model
 from yaramo.edge import Edge
 from yaramo.geo_node import Wgs84GeoNode
 from yaramo.topology import Topology
 
-from orm_importer.utils import (
-    dist_edge,
-    get_additional_signals,
-    get_opposite_edge_pairs,
-    get_signal_classification_number,
-    get_signal_direction,
-    get_signal_function,
-    get_signal_kind,
-    get_signal_name,
-    get_signal_states,
-    is_end_node,
-    is_same_edge,
-    is_signal,
-    is_switch,
-    merge_edges,
-)
+
+def create_overpass_with_url(url: str | None = None) -> overpy.Overpass:
+    if url is None:
+        url = 'https://overpass-api.de/api/interpreter'
+    req = Request(url)
+    req.add_header('Referer', 'https://overpass-api.eu/')
+    req.add_header('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8')
+    req.add_header('Origin', 'https://overpass-turbo.eu')
+    req.add_header('User-Agent', 'yaramo')
+    return overpy.Overpass(url=req)  # type: ignore  # openurl() accepts Request
 
 
 class ORMImporter:
@@ -35,27 +40,36 @@ class ORMImporter:
         self.node_data: dict[str, OverpyNode] = {}
         self.ways: dict[str, List[overpy.Way]] = defaultdict(list)
         self.paths: dict[tuple[Optional[Any], Optional[Any]], List[List]] = defaultdict(list)
-        self.api = overpy.Overpass(url="https://osm.hpi.de/overpass/api/interpreter")
+        self.api = create_overpass_with_url()#url="https://osm.hpi.de/overpass/api/interpreter")#overpy.Overpass(url="https://osm.hpi.de/overpass/api/interpreter")
         self.topology = Topology()
 
-    def _get_track_objects(self, polygon: str, railway_option_types: list[str]):
+        print("orm_importer built")
+        print(self.api.url)
+
+    def _get_track_objects(self, polygon: str, railway_option_types: list[str], date: datetime.datetime):
+        if date is None:
+            date = datetime.datetime.now()
         query_parts = ""
         for _type in railway_option_types:
             query_parts = (
                 query_parts
-                + f'way["railway"="{_type}"](poly: "{polygon}");node(w)(poly: "{polygon}");'
+                + f'way["railway"="{_type}"](poly: "{polygon}");node(w);'#(poly: "{polygon}");'
             )
-        query = f"({query_parts});out body;"
+        date_prefix = f'[timeout:60][date:"{date.strftime("%Y-%m-%dT%H:%M:%SZ")}"];'
+        query = f"{date_prefix}({query_parts});out body;"
         print(query)
         return self._query_api(query)
 
     def _query_api(self, query):
         result = self.api.query(query)
+        print(result)
         return result
 
     def _build_graph(self, track_objects):
         graph = nx.Graph()
+        way: overpy.Way
         for way in track_objects.ways:
+            # print(way.tags)
             previous_node = None
             for idx, node_id in enumerate(way._node_ids):
                 try:
@@ -64,22 +78,40 @@ class ORMImporter:
                     self.ways[str(node_id)].append(way)
                     graph.add_node(node.id)
                     if previous_node:
-                        graph.add_edge(previous_node.id, node.id)
+                        graph.add_edge(previous_node.id, node.id, tags=way.tags)
                     previous_node = node
                 except overpy.exception.DataIncomplete:
                     continue
         return graph
 
-    def _get_next_top_node(self, node, edge: "tuple[str, str]", path):
+    def _get_next_top_node(self, node, edge: "tuple[str, str]", path, common_tags: dict | None = None):
         node_to_id = edge[1]
         node_to = self.node_data[node_to_id]
+        edge_tags = self.graph[edge[0]][edge[1]]["tags"]
+        if common_tags is None:
+            common_tags = edge_tags.copy()
+        common_tag_keys = edge_tags.keys() & common_tags.keys()
+        for key in common_tags.copy():
+            if key not in common_tag_keys:
+                removed_key = common_tags.pop(key, None)
+                if removed_key is not None:
+                    print(f"Key {key} is not present in all parts of the path {path}.")
+
+        for key in common_tag_keys:
+            if not (key in edge_tags and key in common_tags): # should not be reachable?
+               print(f"Key {key}, not in all edges of path {path}") 
+            elif edge_tags[key] != common_tags[key]:
+                removed_key = common_tags.pop(key, None)
+                if removed_key is not None:
+                    print(f"Different values for {key} ({edge_tags[key]} vs {removed_key}) along the path {path}")
+
         if node_to in self.top_nodes:
-            return node_to, path
+            return node_to, path, common_tags
 
         path.append(node_to_id)
 
         if self.graph.degree(node_to_id) == 0:
-            return None, path
+            return None, path, common_tags
 
         distinct_edges = [e for e in self.graph.edges(node_to_id) if not is_same_edge(e, edge)]
         if len(distinct_edges) != 1:
@@ -92,14 +124,14 @@ class ORMImporter:
                 way = common_ways.pop()
                 for edge in distinct_edges:
                     if edge[0] in way._node_ids and edge[1] in way._node_ids:
-                        return self._get_next_top_node(node_to, edge, path)
+                        return self._get_next_top_node(node_to, edge, path, common_tags)
                 raise Exception(
                     f"{len(distinct_edges)}Could not determine next edge to follow for node {node_to_id}."
                 )
             raise Exception(f"Could not determine next edge to follow for node {node_to_id}.")
 
         next_edge = distinct_edges[0]
-        return self._get_next_top_node(node_to, next_edge, path)
+        return self._get_next_top_node(node_to, next_edge, path, common_tags)
 
     def _add_geo_nodes(self, path, top_edge: Edge):
         for idx, node_id in enumerate(path):
@@ -154,10 +186,10 @@ class ORMImporter:
         present_paths = self.paths[(node_a, node_b)] + self.paths[(node_b, node_a)]
         return path not in present_paths and reversed_path not in present_paths
 
-    def run(self, polygon, railway_option_types: list[str] = None):
+    def run(self, polygon, railway_option_types: list[str] = None, date: datetime.datetime | None = None):
         if railway_option_types is None:
             railway_option_types = ["rail"]
-        track_objects = self._get_track_objects(polygon, railway_option_types)
+        track_objects = self._get_track_objects(polygon, railway_option_types, date)
         self.graph = self._build_graph(track_objects)
 
         # ToDo: Check whether all edges really link to each other in ORM or if there might be
@@ -179,7 +211,7 @@ class ORMImporter:
         # DFS-Like to create top and geo edges
         for node in self.top_nodes:
             for edge in self.graph.edges(node.id):
-                next_top_node, path = self._get_next_top_node(node, edge, [])
+                next_top_node, path, tags = self._get_next_top_node(node, edge, [])
                 # Only add geo objects that are on the path between two top nodes
                 if next_top_node and next_top_node != node:
                     node_a = next(
@@ -196,14 +228,19 @@ class ORMImporter:
                     )
                     if node_a and node_b and self._should_add_edge(node_a, node_b, path):
                         self.paths[(node_a, node_b)].append(path)
-                        current_edge = model.Edge(node_a, node_b)
-                        node_a.connected_edges.append(current_edge)
-                        node_b.connected_edges.append(current_edge)
+                        current_edge = model.Edge(node_a, node_b, tags=tags)
+                        print(current_edge.tags)
+                        if current_edge not in node_a.connected_edges:
+                            node_a.connected_edges.append(current_edge)
+                        if current_edge not in node_b.connected_edges:
+                            node_b.connected_edges.append(current_edge)
                         self.topology.add_edge(current_edge)
                         self._add_geo_nodes(path, current_edge)
                         current_edge.update_length()
                         current_edge.maximum_speed = self._get_edge_speed(current_edge)
-                        self._add_signals(path, current_edge, node, next_top_node)
+                        # self._add_signals(path, current_edge, node, next_top_node)
+        
+        print("all top and geo nodes created")
 
         nodes_to_remove = []
         nodes_to_add = []
@@ -257,8 +294,10 @@ class ORMImporter:
                                 new_edge = Edge(node, new_node)
                                 new_edge.maximum_speed = 160
                                 new_edge.update_length()
-                                node.connected_edges.append(new_edge)
-                                new_node.connected_edges.append(new_edge)
+                                if new_edge not in node.connected_edges:
+                                    node.connected_edges.append(new_edge)
+                                if new_edge not in new_node.connected_edges:    
+                                    new_node.connected_edges.append(new_edge)
                                 nodes_to_add.append(new_node)
                                 self.topology.add_edge(new_edge)
                                 break
