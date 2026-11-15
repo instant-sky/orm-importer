@@ -1,7 +1,6 @@
 import pickle
 
 from mock import patch
-
 from orm_importer.importer import ORMImporter
 
 

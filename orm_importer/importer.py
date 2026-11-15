@@ -1,35 +1,26 @@
+import datetime
 import math
 from collections import defaultdict
 from typing import Any, List, Optional
+from urllib.request import Request
 
 import networkx as nx
 import overpy
-import datetime
+from orm_importer.utils import (dist_edge, get_additional_signals,
+                                get_opposite_edge_pairs,
+                                get_signal_classification_number,
+                                get_signal_direction, get_signal_function,
+                                get_signal_kind, get_signal_name,
+                                get_signal_states, is_end_node, is_same_edge,
+                                is_signal, is_switch, merge_edges)
 from overpy import Node as OverpyNode
 from overpy.exception import DataIncomplete
+
 from yaramo import model
 from yaramo.edge import Edge
 from yaramo.geo_node import Wgs84GeoNode
 from yaramo.topology import Topology
 
-from orm_importer.utils import (
-    dist_edge,
-    get_additional_signals,
-    get_opposite_edge_pairs,
-    get_signal_classification_number,
-    get_signal_direction,
-    get_signal_function,
-    get_signal_kind,
-    get_signal_name,
-    get_signal_states,
-    is_end_node,
-    is_same_edge,
-    is_signal,
-    is_switch,
-    merge_edges,
-)
-
-from urllib.request import Request
 
 def create_overpass_with_url(url: str | None = None) -> overpy.Overpass:
     if url is None:
@@ -71,11 +62,14 @@ class ORMImporter:
 
     def _query_api(self, query):
         result = self.api.query(query)
+        print(result)
         return result
 
     def _build_graph(self, track_objects):
         graph = nx.Graph()
+        way: overpy.Way
         for way in track_objects.ways:
+            # print(way.tags)
             previous_node = None
             for idx, node_id in enumerate(way._node_ids):
                 try:
@@ -84,22 +78,40 @@ class ORMImporter:
                     self.ways[str(node_id)].append(way)
                     graph.add_node(node.id)
                     if previous_node:
-                        graph.add_edge(previous_node.id, node.id)
+                        graph.add_edge(previous_node.id, node.id, tags=way.tags)
                     previous_node = node
                 except overpy.exception.DataIncomplete:
                     continue
         return graph
 
-    def _get_next_top_node(self, node, edge: "tuple[str, str]", path):
+    def _get_next_top_node(self, node, edge: "tuple[str, str]", path, common_tags: dict | None = None):
         node_to_id = edge[1]
         node_to = self.node_data[node_to_id]
+        edge_tags = self.graph[edge[0]][edge[1]]["tags"]
+        if common_tags is None:
+            common_tags = edge_tags.copy()
+        common_tag_keys = edge_tags.keys() & common_tags.keys()
+        for key in common_tags.copy():
+            if key not in common_tag_keys:
+                removed_key = common_tags.pop(key, None)
+                if removed_key is not None:
+                    print(f"Key {key} is not present in all parts of the path {path}.")
+
+        for key in common_tag_keys:
+            if not (key in edge_tags and key in common_tags): # should not be reachable?
+               print(f"Key {key}, not in all edges of path {path}") 
+            elif edge_tags[key] != common_tags[key]:
+                removed_key = common_tags.pop(key, None)
+                if removed_key is not None:
+                    print(f"Different values for {key} ({edge_tags[key]} vs {removed_key}) along the path {path}")
+
         if node_to in self.top_nodes:
-            return node_to, path
+            return node_to, path, common_tags
 
         path.append(node_to_id)
 
         if self.graph.degree(node_to_id) == 0:
-            return None, path
+            return None, path, common_tags
 
         distinct_edges = [e for e in self.graph.edges(node_to_id) if not is_same_edge(e, edge)]
         if len(distinct_edges) != 1:
@@ -112,14 +124,14 @@ class ORMImporter:
                 way = common_ways.pop()
                 for edge in distinct_edges:
                     if edge[0] in way._node_ids and edge[1] in way._node_ids:
-                        return self._get_next_top_node(node_to, edge, path)
+                        return self._get_next_top_node(node_to, edge, path, common_tags)
                 raise Exception(
                     f"{len(distinct_edges)}Could not determine next edge to follow for node {node_to_id}."
                 )
             raise Exception(f"Could not determine next edge to follow for node {node_to_id}.")
 
         next_edge = distinct_edges[0]
-        return self._get_next_top_node(node_to, next_edge, path)
+        return self._get_next_top_node(node_to, next_edge, path, common_tags)
 
     def _add_geo_nodes(self, path, top_edge: Edge):
         for idx, node_id in enumerate(path):
@@ -199,7 +211,7 @@ class ORMImporter:
         # DFS-Like to create top and geo edges
         for node in self.top_nodes:
             for edge in self.graph.edges(node.id):
-                next_top_node, path = self._get_next_top_node(node, edge, [])
+                next_top_node, path, tags = self._get_next_top_node(node, edge, [])
                 # Only add geo objects that are on the path between two top nodes
                 if next_top_node and next_top_node != node:
                     node_a = next(
@@ -216,7 +228,8 @@ class ORMImporter:
                     )
                     if node_a and node_b and self._should_add_edge(node_a, node_b, path):
                         self.paths[(node_a, node_b)].append(path)
-                        current_edge = model.Edge(node_a, node_b)
+                        current_edge = model.Edge(node_a, node_b, tags=tags)
+                        print(current_edge.tags)
                         if current_edge not in node_a.connected_edges:
                             node_a.connected_edges.append(current_edge)
                         if current_edge not in node_b.connected_edges:
@@ -225,7 +238,9 @@ class ORMImporter:
                         self._add_geo_nodes(path, current_edge)
                         current_edge.update_length()
                         current_edge.maximum_speed = self._get_edge_speed(current_edge)
-                        self._add_signals(path, current_edge, node, next_top_node)
+                        # self._add_signals(path, current_edge, node, next_top_node)
+        
+        print("all top and geo nodes created")
 
         nodes_to_remove = []
         nodes_to_add = []

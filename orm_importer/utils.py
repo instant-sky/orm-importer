@@ -6,14 +6,12 @@ import numpy as np
 import overpy.exception
 from haversine import haversine
 from overpy import Node, Way
+
 from yaramo import model
-from yaramo.additional_signal import (
-    AdditionalSignal,
-    AdditionalSignalZs2,
-    AdditionalSignalZs2v,
-    AdditionalSignalZs3,
-    AdditionalSignalZs3v,
-)
+from yaramo.additional_signal import (AdditionalSignal, AdditionalSignalZs2,
+                                      AdditionalSignalZs2v,
+                                      AdditionalSignalZs3,
+                                      AdditionalSignalZs3v)
 from yaramo.edge import Edge
 from yaramo.signal import SignalState
 
