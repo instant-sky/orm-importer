@@ -19,6 +19,7 @@ mock = "4.0.3"
 networkx = {extras = ["default"], version = "^3.4.2"}
 numpy = "^1.26.3"
 overpy = "0.6"
+osmium = "^4.3.2"
 packaging = "22.0"
 pluggy = "1.5.0"
 py = "1.11.0"

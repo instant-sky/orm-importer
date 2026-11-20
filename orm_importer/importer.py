@@ -1,11 +1,14 @@
 import datetime
 import math
+import os
+import socket
 from collections import defaultdict
 from typing import Any, List, Optional
 from urllib.request import Request
 
 import networkx as nx
 import overpy
+from orm_importer.local_source import load_from_osm_file
 from orm_importer.utils import (dist_edge, get_additional_signals,
                                 get_opposite_edge_pairs,
                                 get_signal_classification_number,
@@ -14,7 +17,8 @@ from orm_importer.utils import (dist_edge, get_additional_signals,
                                 get_signal_states, is_end_node, is_same_edge,
                                 is_signal, is_switch, merge_edges)
 from overpy import Node as OverpyNode
-from overpy.exception import DataIncomplete
+from overpy.exception import (DataIncomplete, OverpassBadRequest,
+                               OverPyException)
 
 from yaramo import model
 from yaramo.edge import Edge
@@ -22,48 +26,84 @@ from yaramo.geo_node import Wgs84GeoNode
 from yaramo.topology import Topology
 
 
+# tried in order; the first entry can be overridden via the OVERPASS_URL env var
+# or the overpass_url argument of ORMImporter
+OVERPASS_URLS = [
+    "https://osm.hpi.de/overpass/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+]
+
+
 def create_overpass_with_url(url: str | None = None) -> overpy.Overpass:
     if url is None:
-        url = 'https://overpass-api.de/api/interpreter'
+        url = os.environ.get("OVERPASS_URL", OVERPASS_URLS[0])
     req = Request(url)
-    req.add_header('Referer', 'https://overpass-api.eu/')
     req.add_header('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8')
-    req.add_header('Origin', 'https://overpass-turbo.eu')
-    req.add_header('User-Agent', 'yaramo')
-    return overpy.Overpass(url=req)  # type: ignore  # openurl() accepts Request
+    # overpass-api.de rejects generic user agents (e.g. Python-urllib) with 406
+    req.add_header('User-Agent', 'orm-importer/yaramo (railway topology import, HPI)')
+    # overpy retries 429/504 ("Server load too high") itself
+    return overpy.Overpass(url=req, max_retry_count=2, retry_timeout=30)  # type: ignore  # openurl() accepts Request
 
 
 class ORMImporter:
-    def __init__(self):
+    def __init__(self, overpass_url: str | None = None, osm_file: str | None = None):
+        """
+        :param osm_file: local OSM file (e.g. data/germany-railway.osm.pbf) to read
+            instead of querying Overpass. Requires osmium-tool.
+        """
         self.graph = None
+        self.osm_file = osm_file
         self.top_nodes: list[OverpyNode] = []
         self.node_data: dict[str, OverpyNode] = {}
         self.ways: dict[str, List[overpy.Way]] = defaultdict(list)
         self.paths: dict[tuple[Optional[Any], Optional[Any]], List[List]] = defaultdict(list)
-        self.api = create_overpass_with_url()#url="https://osm.hpi.de/overpass/api/interpreter")#overpy.Overpass(url="https://osm.hpi.de/overpass/api/interpreter")
+        first_url = overpass_url or os.environ.get("OVERPASS_URL", OVERPASS_URLS[0])
+        self.overpass_urls = [first_url] + [u for u in OVERPASS_URLS if u != first_url]
+        self.api = create_overpass_with_url(first_url)
         self.topology = Topology()
 
         print("orm_importer built")
-        print(self.api.url)
+        print(osm_file or first_url)
 
     def _get_track_objects(self, polygon: str, railway_option_types: list[str], date: datetime.datetime):
-        if date is None:
-            date = datetime.datetime.now()
+        if self.osm_file is not None:
+            if date is not None:
+                print("date is ignored for local OSM files, use a dated snapshot file instead")
+            return load_from_osm_file(self.osm_file, polygon, railway_option_types)
         query_parts = ""
         for _type in railway_option_types:
             query_parts = (
                 query_parts
                 + f'way["railway"="{_type}"](poly: "{polygon}");node(w);'#(poly: "{polygon}");'
             )
-        date_prefix = f'[timeout:60][date:"{date.strftime("%Y-%m-%dT%H:%M:%SZ")}"];'
-        query = f"{date_prefix}({query_parts});out body;"
+        date_prefix = f'[date:"{date.strftime("%Y-%m-%dT%H:%M:%SZ")}"];' if date is not None else ""
+        query = f"[timeout:180]{date_prefix}({query_parts});out body;"
         print(query)
         return self._query_api(query)
 
     def _query_api(self, query):
-        result = self.api.query(query)
-        print(result)
-        return result
+        last_error: Exception | None = None
+        for url in self.overpass_urls:
+            api = create_overpass_with_url(url)
+            # overpy has no timeout parameter; an overloaded server may accept the
+            # connection and never answer, so bound socket reads above [timeout:180]
+            previous_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(240)
+            try:
+                result = api.query(query)
+            except OverpassBadRequest:
+                raise  # broken query, other servers won't accept it either
+            except (OverPyException, OSError) as e:  # OSError covers URLError and TimeoutError
+                print(f"Overpass query on {url} failed: {e!r}")
+                last_error = e
+                continue
+            finally:
+                socket.setdefaulttimeout(previous_timeout)
+            # resolve_missing=True later queries through result.api, so keep the working server
+            self.api = api
+            print(f"Overpass query on {url} succeeded: {result}")
+            return result
+        raise RuntimeError("All Overpass servers failed") from last_error
 
     def _build_graph(self, track_objects):
         graph = nx.Graph()
